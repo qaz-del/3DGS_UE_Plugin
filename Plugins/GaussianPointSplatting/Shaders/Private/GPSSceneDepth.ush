@@ -1,0 +1,16 @@
+// SceneColor and SceneDepth may have different extents/ViewRects (TSR, editor,
+// screen percentage, split screen). Input coordinates are on the sample grid.
+Texture2D SceneDepthTexture;
+uint UseSceneDepthTest;
+float SceneDepthBiasCm;
+float2 SceneDepthViewMin;
+float2 SceneDepthViewSize;
+
+bool GPSBehindScene(int2 SamplePixel, float ViewDepth, float2 SampleViewMin, float2 SampleViewSize)
+{
+	if (UseSceneDepthTest == 0u) return false;
+	float2 UV = (float2(SamplePixel) + 0.5f - SampleViewMin) / SampleViewSize;
+	int2 Coord = int2(SceneDepthViewMin + clamp(UV, 0.0f, 0.999999f) * SceneDepthViewSize);
+	float DeviceZ = SceneDepthTexture.Load(int3(Coord, 0)).r;
+	return ViewDepth > ConvertFromDeviceZ(DeviceZ) + SceneDepthBiasCm;
+}

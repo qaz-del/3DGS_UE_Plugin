@@ -1,0 +1,281 @@
+#include "/Engine/Public/Platform.ush"
+#include "/Engine/Private/Common.ush"
+#include "/Plugin/GaussianPointSplatting/Private/GPSPackedGaussian.ush"
+#include "/Plugin/GaussianPointSplatting/Private/GPSSceneDepth.ush"
+
+StructuredBuffer<uint> VisibleIndices;
+Texture2D FurthestHZBTexture;
+RWTexture2D<UlongType> NearestUAV;
+Texture2D<UlongType> NearestSRV;
+StructuredBuffer<uint> SourceIDs;
+RWTexture2DArray<float4> LayerColor;
+RWTexture2DArray<uint2> LayerHit;
+uint LayerIndex;
+float Supersampling;
+float MinViewDepth;
+float4x4 LocalToView;
+RWTexture2D<uint> AccumRTexture;
+RWTexture2D<uint> AccumGTexture;
+RWTexture2D<uint> AccumBTexture;
+RWTexture2D<uint> AccumATexture;
+Texture2D<uint> ResolvedAccumRTexture;
+Texture2D<uint> ResolvedAccumGTexture;
+Texture2D<uint> ResolvedAccumBTexture;
+Texture2D<uint> ResolvedAccumATexture;
+
+uint NumGaussians;
+uint UseVisibleIndices;
+uint LinearDispatchThreadStride;
+float PointRadiusPixels;
+uint DebugVisualizeSplatRadius;
+uint UseHZBOcclusion;
+float HZBDepthBiasCm;
+float AnalyticAlphaScale;
+float AnalyticCoveragePower;
+float2 HZBSize;
+float2 ViewportUVToHZBBufferUV;
+float GaussianScaleMultiplier;
+float MaxSplatRadiusPixels;
+float MinSplatRadiusPixels;
+float2 OutputSize;
+float2 ViewRectMin;
+float2 ViewRectSize;
+float4x4 LocalToClip;
+
+float3 RotateByQuat(float4 Quat, float3 V)
+{
+	return V + 2.0f * cross(Quat.xyz, cross(Quat.xyz, V) + Quat.w * V);
+}
+
+float3 RadiusHeatmap(float RadiusPixels)
+{
+	float Denom = max(MaxSplatRadiusPixels - MinSplatRadiusPixels, 0.001f);
+	float T = saturate((RadiusPixels - MinSplatRadiusPixels) / Denom);
+	float3 Cold = float3(0.05f, 0.25f, 1.0f);
+	float3 Mid = float3(0.0f, 1.0f, 0.35f);
+	float3 Hot = float3(1.0f, 0.12f, 0.02f);
+	return T < 0.5f ? lerp(Cold, Mid, T * 2.0f) : lerp(Mid, Hot, (T - 0.5f) * 2.0f);
+}
+
+float ClampProjectedCovariance(inout float2x2 Cov)
+{
+	float Trace = Cov[0][0] + Cov[1][1];
+	float Difference = Cov[0][0] - Cov[1][1];
+	float EigenGap = sqrt(max(Difference * Difference + 4.0f * Cov[0][1] * Cov[0][1], 0.0f));
+	float EigenMax = 0.5f * (Trace + EigenGap);
+	float MaxVariance = MaxSplatRadiusPixels * MaxSplatRadiusPixels / 9.0f;
+	if (EigenMax <= MaxVariance)
+	{
+		return EigenMax;
+	}
+	float EigenMin = 0.5f * (Trace - EigenGap);
+	float LimitedMin = min(EigenMin, MaxVariance);
+	if (EigenGap <= 1.0e-6f)
+	{
+		Cov[0][0] = MaxVariance;
+		Cov[0][1] = 0.0f;
+		Cov[1][0] = 0.0f;
+		Cov[1][1] = MaxVariance;
+		return MaxVariance;
+	}
+	float AxisScale = (MaxVariance - LimitedMin) / EigenGap;
+	Cov[0][0] = LimitedMin + (Cov[0][0] - EigenMin) * AxisScale;
+	Cov[0][1] *= AxisScale;
+	Cov[1][0] = Cov[0][1];
+	Cov[1][1] = LimitedMin + (Cov[1][1] - EigenMin) * AxisScale;
+	return MaxVariance;
+}
+
+float2 PixelToBufferUV(float2 Pixel)
+{
+	return (Pixel + 0.5f - ViewRectMin) / max(ViewRectSize, float2(1.0f, 1.0f));
+}
+
+bool IsOccludedByHZB(int2 MinP, int2 MaxP, float GaussianSceneDepth)
+{
+	if (UseHZBOcclusion == 0)
+	{
+		return false;
+	}
+	float2 FootprintPixels = max(float2(MaxP - MinP + int2(1, 1)), float2(1.0f, 1.0f));
+	float2 FootprintHZBTexels = FootprintPixels * HZBSize / max(ViewRectSize, float2(1.0f, 1.0f));
+	float MipLevel = clamp(ceil(log2(max(max(FootprintHZBTexels.x, FootprintHZBTexels.y), 1.0f))), 0.0f, 12.0f);
+	float2 MinUV = PixelToBufferUV(float2(MinP)) * ViewportUVToHZBBufferUV;
+	float2 MaxUV = PixelToBufferUV(float2(MaxP)) * ViewportUVToHZBBufferUV;
+	float2 CenterUV = PixelToBufferUV((float2(MinP) + float2(MaxP)) * 0.5f) * ViewportUVToHZBBufferUV;
+	float DeviceZ0 = FurthestHZBTexture.SampleLevel(GlobalPointClampedSampler, CenterUV, MipLevel).r;
+	float DeviceZ1 = FurthestHZBTexture.SampleLevel(GlobalPointClampedSampler, float2(MinUV.x, MinUV.y), MipLevel).r;
+	float DeviceZ2 = FurthestHZBTexture.SampleLevel(GlobalPointClampedSampler, float2(MaxUV.x, MinUV.y), MipLevel).r;
+	float DeviceZ3 = FurthestHZBTexture.SampleLevel(GlobalPointClampedSampler, float2(MinUV.x, MaxUV.y), MipLevel).r;
+	float DeviceZ4 = FurthestHZBTexture.SampleLevel(GlobalPointClampedSampler, float2(MaxUV.x, MaxUV.y), MipLevel).r;
+	float FurthestSceneDepth = max(ConvertFromDeviceZ(DeviceZ0), ConvertFromDeviceZ(DeviceZ1));
+	FurthestSceneDepth = max(FurthestSceneDepth, ConvertFromDeviceZ(DeviceZ2));
+	FurthestSceneDepth = max(FurthestSceneDepth, ConvertFromDeviceZ(DeviceZ3));
+	FurthestSceneDepth = max(FurthestSceneDepth, ConvertFromDeviceZ(DeviceZ4));
+	return GaussianSceneDepth > FurthestSceneDepth + HZBDepthBiasCm;
+}
+
+bool ProjectLocalToPixel(float3 LocalPosition, out float2 Pixel, out float ClipW)
+{
+	float4 Clip = mul(float4(LocalPosition, 1.0f), LocalToClip);
+	ClipW = mul(float4(LocalPosition, 1.0f), LocalToView).z;
+	if (Clip.w <= 0.0001f || ClipW <= MinViewDepth)
+	{
+		Pixel = 0.0f;
+		return false;
+	}
+	float2 Ndc = Clip.xy / Clip.w;
+	Pixel = ViewRectMin + float2((Ndc.x * 0.5f + 0.5f) * ViewRectSize.x,
+		(1.0f - (Ndc.y * 0.5f + 0.5f)) * ViewRectSize.y);
+	return true;
+}
+
+[numthreads(64, 1, 1)]
+void AnalyticClearCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+	uint LinearIndex = DispatchThreadId.x + DispatchThreadId.y * LinearDispatchThreadStride;
+	uint Width = (uint)OutputSize.x;
+	uint Height = (uint)OutputSize.y;
+	if (Width == 0u || Height == 0u || LinearIndex >= Width * Height)
+	{
+		return;
+	}
+	uint2 P = uint2(LinearIndex % Width, LinearIndex / Width);
+	AccumRTexture[P] = 0u;
+	AccumGTexture[P] = 0u;
+	AccumBTexture[P] = 0u;
+	AccumATexture[P] = 0u;
+	NearestUAV[P] = PackUlongType(uint2(0u, 0u));
+}
+
+[numthreads(64, 1, 1)]
+void AnalyticResolveCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+	uint LinearIndex = DispatchThreadId.x + DispatchThreadId.y * LinearDispatchThreadStride;
+	uint Width = (uint)OutputSize.x;
+	uint Height = (uint)OutputSize.y;
+	if (Width == 0u || Height == 0u || LinearIndex >= Width * Height)
+	{
+		return;
+	}
+	uint2 P = uint2(LinearIndex % Width, LinearIndex / Width);
+	uint Weight = ResolvedAccumATexture.Load(int3(P, 0));
+	uint3 LayerCoord = uint3(P, LayerIndex);
+	LayerColor[LayerCoord] = 0.0f;
+	LayerHit[LayerCoord] = uint2(0u, 0xffffffffu);
+	if (Weight == 0u) return;
+	float InvWeight = 1.0f / (float)Weight;
+	float3 SplatRgb = float3(
+		(float)ResolvedAccumRTexture.Load(int3(P, 0)) * InvWeight,
+		(float)ResolvedAccumGTexture.Load(int3(P, 0)) * InvWeight,
+		(float)ResolvedAccumBTexture.Load(int3(P, 0)) * InvWeight);
+	float Alpha = 1.0f - exp(-((float)Weight / 255.0f));
+	LayerColor[LayerCoord] = float4(SplatRgb * Alpha, Alpha);
+	uint2 Key = UnpackUlongType(NearestSRV.Load(int3(P, 0)));
+	if (Key.y != 0u) LayerHit[LayerCoord] = uint2(~Key.y, SourceIDs[~Key.x]);
+}
+
+[numthreads(64, 1, 1)]
+void MainCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+	uint LinearIndex = DispatchThreadId.x + DispatchThreadId.y * LinearDispatchThreadStride;
+	if (LinearIndex >= NumGaussians)
+	{
+		return;
+	}
+	uint GaussianIndex = LinearIndex;
+	if (UseVisibleIndices != 0u)
+	{
+		GaussianIndex = VisibleIndices[LinearIndex];
+	}
+	float2 Pixel;
+	float3 LocalPosition = GPSDecodePosition(GaussianIndex);
+	float ClipW;
+	if (!ProjectLocalToPixel(LocalPosition, Pixel, ClipW))
+	{
+		return;
+	}
+	float3 Scale = max(GPSDecodeScale(GaussianIndex) * GaussianScaleMultiplier, float3(0.0001f, 0.0001f, 0.0001f));
+	float4 Rotation = GPSDecodeRotation(GaussianIndex);
+	float3 Axis0 = RotateByQuat(Rotation, float3(Scale.x, 0.0f, 0.0f));
+	float3 Axis1 = RotateByQuat(Rotation, float3(0.0f, Scale.y, 0.0f));
+	float3 Axis2 = RotateByQuat(Rotation, float3(0.0f, 0.0f, Scale.z));
+	float2 Pixel0, Pixel1, Pixel2;
+	float TempW;
+	bool bProjected0 = ProjectLocalToPixel(LocalPosition + Axis0, Pixel0, TempW);
+	bool bProjected1 = ProjectLocalToPixel(LocalPosition + Axis1, Pixel1, TempW);
+	bool bProjected2 = ProjectLocalToPixel(LocalPosition + Axis2, Pixel2, TempW);
+	float FallbackRadius = clamp(PointRadiusPixels, MinSplatRadiusPixels, MaxSplatRadiusPixels);
+	float2 D0 = bProjected0 ? Pixel0 - Pixel : float2(FallbackRadius, 0.0f);
+	float2 D1 = bProjected1 ? Pixel1 - Pixel : float2(0.0f, FallbackRadius);
+	float2 D2 = bProjected2 ? Pixel2 - Pixel : float2(0.0f, 0.0f);
+	float2x2 Cov;
+	Cov[0][0] = dot(float3(D0.x, D1.x, D2.x), float3(D0.x, D1.x, D2.x)) + 0.3f * Supersampling * Supersampling;
+	Cov[0][1] = dot(float3(D0.x, D1.x, D2.x), float3(D0.y, D1.y, D2.y));
+	Cov[1][0] = Cov[0][1];
+	Cov[1][1] = dot(float3(D0.y, D1.y, D2.y), float3(D0.y, D1.y, D2.y)) + 0.3f * Supersampling * Supersampling;
+	float LambdaMax = max(ClampProjectedCovariance(Cov), MinSplatRadiusPixels * MinSplatRadiusPixels);
+	float RadiusPixels = clamp(3.0f * sqrt(LambdaMax), MinSplatRadiusPixels, MaxSplatRadiusPixels);
+	float Det = Cov[0][0] * Cov[1][1] - Cov[0][1] * Cov[1][0];
+	if (Det <= 1.0e-6f)
+	{
+		return;
+	}
+	float InvDet = 1.0f / Det;
+	float2x2 InvCov;
+	InvCov[0][0] = Cov[1][1] * InvDet;
+	InvCov[0][1] = -Cov[0][1] * InvDet;
+	InvCov[1][0] = -Cov[1][0] * InvDet;
+	InvCov[1][1] = Cov[0][0] * InvDet;
+	int2 MinP = int2(max(floor(Pixel - RadiusPixels), ViewRectMin));
+	int2 MaxP = int2(min(ceil(Pixel + RadiusPixels), ViewRectMin + ViewRectSize - float2(1.0f, 1.0f)));
+	if (any(MinP > MaxP))
+	{
+		return;
+	}
+	float4 Color = GPSDecodeColor(GaussianIndex);
+	if (IsOccludedByHZB(MinP, MaxP, ClipW))
+	{
+		return;
+	}
+	for (int Y = MinP.y; Y <= MaxP.y; ++Y)
+	{
+		for (int X = MinP.x; X <= MaxP.x; ++X)
+		{
+			int2 P = int2(X, Y);
+			if (GPSBehindScene(P, ClipW, ViewRectMin, ViewRectSize))
+			{
+				continue;
+			}
+			float2 Delta = (float2(P) + 0.5f) - Pixel;
+			float Power = InvCov[0][0] * Delta.x * Delta.x + 2.0f * InvCov[0][1] * Delta.x * Delta.y + InvCov[1][1] * Delta.y * Delta.y;
+			if (Power > 9.0f)
+			{
+				continue;
+			}
+			float GaussianWeight = pow(exp(-0.5f * Power), max(AnalyticCoveragePower, 0.001f));
+			float Alpha = saturate(Color.a * GaussianWeight * AnalyticAlphaScale);
+			float3 SplatRgb = Color.rgb;
+			if (DebugVisualizeSplatRadius == 1u)
+			{
+				SplatRgb = RadiusHeatmap(RadiusPixels);
+				Alpha = saturate(max(Alpha, 0.35f * GaussianWeight));
+			}
+			else if (DebugVisualizeSplatRadius == 2u)
+			{
+				SplatRgb = float3(GaussianWeight, GaussianWeight, GaussianWeight);
+				Alpha = saturate(max(Alpha, GaussianWeight));
+			}
+			if (Alpha > (1.0f / 255.0f))
+			{
+				uint Weight = (uint)round(Alpha * 255.0f);
+				ImageInterlockedMaxUInt64(NearestUAV, uint2(P),
+					PackUlongType(uint2(~GaussianIndex, ~asuint(ClipW))));
+				InterlockedAdd(AccumRTexture[P], (uint)round(saturate(SplatRgb.r) * (float)Weight));
+				InterlockedAdd(AccumGTexture[P], (uint)round(saturate(SplatRgb.g) * (float)Weight));
+				InterlockedAdd(AccumBTexture[P], (uint)round(saturate(SplatRgb.b) * (float)Weight));
+				InterlockedAdd(AccumATexture[P], Weight);
+			}
+		}
+	}
+}

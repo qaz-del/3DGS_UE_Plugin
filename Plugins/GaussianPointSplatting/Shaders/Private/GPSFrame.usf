@@ -1,0 +1,112 @@
+#include "/Engine/Public/Platform.ush"
+#include "/Engine/Private/Common.ush"
+
+Texture2DArray<float4> LayerColor;
+Texture2DArray<uint2> LayerHit;
+StructuredBuffer<uint> ComponentIDs;
+Texture2D<float4> SceneColor;
+RWTexture2D<float4> OutputColor;
+RWTexture2D<float> OutputDepth;
+RWTexture2D<uint2> OutputID;
+RWTexture2D<float> OutputCoverage;
+uint LayerCount;
+uint Supersampling;
+uint DebugOutput;
+float DepthAlphaThreshold;
+int2 OutputExtent;
+int2 ViewMin;
+int2 ViewSize;
+
+float3 IDColor(uint2 ID)
+{
+	uint V = ID.x * 1664525u + ID.y * 1013904223u;
+	V ^= V >> 16u;
+	return float3(V & 255u, (V >> 8u) & 255u, (V >> 16u) & 255u) / 255.0f;
+}
+
+[numthreads(8, 8, 1)]
+void CompositeCS(uint3 DispatchID : SV_DispatchThreadID)
+{
+	int2 P = int2(DispatchID.xy);
+	if (any(P >= OutputExtent)) return;
+	float4 Background = SceneColor.Load(int3(P, 0));
+	OutputDepth[P] = 0.0f;
+	OutputID[P] = uint2(0u, 0xffffffffu);
+	OutputCoverage[P] = 0.0f;
+	OutputColor[P] = Background;
+	if (any(P < ViewMin) || any(P >= ViewMin + ViewSize)) return;
+	float3 Color = 0.0f;
+	float Coverage = 0.0f;
+	uint Nearest = 0x7f7fffffu;
+	uint2 PickID = uint2(0u, 0xffffffffu);
+	[loop] for (uint Y = 0u; Y < Supersampling; ++Y)
+	[loop] for (uint X = 0u; X < Supersampling; ++X)
+	{
+		int2 SamplePixel = P * int(Supersampling) + int2(X, Y);
+		float3 SampleColor = 0.0f;
+		float Transmittance = 1.0f;
+		uint PreviousDepth = 0u;
+		int PreviousLayer = -1;
+		// Sort component layers per sample; ties use stable component order.
+		// Components are layers, not individual sorted transparent Gaussians.
+		[loop] for (uint Step = 0u; Step < LayerCount; ++Step)
+		{
+			uint NextDepth = 0x7f7fffffu;
+			int NextLayer = -1;
+			[loop] for (uint L = 0u; L < LayerCount; ++L)
+			{
+				uint D = LayerHit.Load(int4(SamplePixel, L, 0)).x;
+				bool After = D > PreviousDepth || (D == PreviousDepth && int(L) > PreviousLayer);
+				if (D != 0u && After && D < NextDepth) { NextDepth = D; NextLayer = int(L); }
+			}
+			if (NextLayer < 0) break;
+			float4 Layer = LayerColor.Load(int4(SamplePixel, NextLayer, 0));
+			if (Transmittance * Layer.a >= DepthAlphaThreshold && NextDepth < Nearest)
+			{
+				Nearest = NextDepth;
+				PickID = uint2(ComponentIDs[NextLayer], LayerHit.Load(int4(SamplePixel, NextLayer, 0)).y);
+			}
+			SampleColor += Transmittance * Layer.rgb;
+			Transmittance *= 1.0f - saturate(Layer.a);
+			PreviousDepth = NextDepth;
+			PreviousLayer = NextLayer;
+			if (Transmittance < 1.0e-4f) break;
+		}
+		Color += SampleColor + Transmittance * Background.rgb;
+		Coverage += 1.0f - Transmittance;
+	}
+	float InvSamples = rcp(float(Supersampling * Supersampling));
+	Color *= InvSamples;
+	Coverage *= InvSamples;
+	float Depth = PickID.x != 0u ? asfloat(Nearest) : 0.0f;
+	OutputDepth[P] = Depth;
+	OutputID[P] = PickID;
+	OutputCoverage[P] = Coverage;
+	if (DebugOutput == 1u) Color = Depth > 0.0f ? (1.0f / (1.0f + Depth * 0.001f)).xxx : 0.0f;
+	if (DebugOutput == 2u) Color = PickID.x != 0u ? IDColor(PickID) : 0.0f;
+	if (DebugOutput == 3u) Color = Coverage.xxx;
+	OutputColor[P] = float4(Color, lerp(Background.a, 1.0f, Coverage));
+}
+
+Texture2D<float> PickDepth;
+Texture2D<uint2> PickIDTexture;
+Texture2D<float> PickCoverage;
+RWStructuredBuffer<uint4> PickResult;
+int2 PickPixel;
+int2 PickViewMin;
+int2 PickViewMax;
+float MinCoverage;
+
+[numthreads(1, 1, 1)]
+void PickCS(uint3 DispatchID : SV_DispatchThreadID)
+{
+	uint4 Result = uint4(0u, 0xffffffffu, 0u, 0u);
+	if (all(PickPixel >= PickViewMin) && all(PickPixel < PickViewMax))
+	{
+		uint2 ID = PickIDTexture.Load(int3(PickPixel, 0));
+		float CoverageValue = PickCoverage.Load(int3(PickPixel, 0));
+		if (ID.x != 0u && CoverageValue >= MinCoverage)
+			Result = uint4(ID, asuint(PickDepth.Load(int3(PickPixel, 0))), asuint(CoverageValue));
+	}
+	PickResult[0] = Result;
+}

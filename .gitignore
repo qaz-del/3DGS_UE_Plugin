@@ -1,0 +1,99 @@
+# Repository root is GS_Plugin/. Publish plugin source only.
+# Keep local host-project config, Content, .uproject, Source, Tools and captures
+# out of the repository. Plugin Source/Config are admitted through Plugins/.
+/*
+!/.gitignore
+!/README*
+!/LICENSE
+!/LICENSE.*
+!/COPYING*
+!/NOTICE*
+!/Plugins/
+/Plugins/*
+!/Plugins/GaussianPointSplatting/
+
+# Unreal generated build output, caches and packaged builds (including plugins).
+**/Binaries/
+**/Intermediate/
+**/Saved/
+**/DerivedDataCache/
+**/Build/
+**/StagedBuilds/
+**/Cooked/
+**/LocalBuilds/
+
+# Data is downloaded separately and imported locally. Generated Gaussian root,
+# chunk and spatial-index assets are data too; none are distributed in Git.
+*.uasset
+*.umap
+*.uexp
+*.ubulk
+*.uptnl
+*.utoc
+*.ucas
+*.pak
+*.ply
+*.splat
+*.ksplat
+*.spz
+*.pcd
+*.las
+*.laz
+*.e57
+*.zip
+*.7z
+*.rar
+*.tar
+*.gz
+/Data/
+/Datasets/
+/Downloads/
+
+# IDE/project generation and compiled artifacts.
+**/.vs/
+**/.idea/
+**/.vscode/
+*.sln
+*.slnx
+*.suo
+*.user
+*.VC.db
+*.VC.opendb
+*.VC.db-shm
+*.VC.db-wal
+*.vcxproj
+*.vcxproj.filters
+*.vcxproj.user
+*.code-workspace
+*.dll
+*.exe
+*.pdb
+*.obj
+*.pch
+*.ilk
+*.exp
+*.lib
+__pycache__/
+*.pyc
+
+# Captures, logs, local backups and reference-only development material.
+*.rdc
+*.wpix
+*.cap
+*.utrace
+*.ue4stats
+*.log
+/Artifacts/
+/Plugins/GaussianPointSplatting/MeshExtractionResearch.md
+/Plugins/GaussianPointSplatting/Shaders/Private/GPSPointSplat.txt
+
+# Local agent/tool settings and environment-specific files.
+**/.agents/
+**/.codex/
+**/.aws/
+.env
+.env.*
+!.env.example
+.DS_Store
+Thumbs.db
+Desktop.ini

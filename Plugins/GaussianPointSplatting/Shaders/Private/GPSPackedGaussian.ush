@@ -1,0 +1,50 @@
+#pragma once
+
+StructuredBuffer<uint4> GPSPackedGeometry;
+StructuredBuffer<uint> GPSPackedColors;
+StructuredBuffer<uint> GPSPackedOpacities;
+float4 GPSPositionMin;
+float4 GPSPositionExtent;
+float GPSScaleLogMin;
+float GPSScaleLogExtent;
+
+float3 GPSDecodePosition(uint Index)
+{
+	uint4 Geometry = GPSPackedGeometry[Index];
+	uint X = Geometry.x & 0x3fffffu;
+	uint Y = (Geometry.x >> 22u) | ((Geometry.y & 0x7ffu) << 10u);
+	uint Z = Geometry.y >> 11u;
+	float3 Unit = float3((float)X / 4194303.0f, (float)Y / 2097151.0f, (float)Z / 2097151.0f);
+	return GPSPositionMin.xyz + Unit * GPSPositionExtent.xyz;
+}
+
+float3 GPSDecodeScale(uint Index)
+{
+	uint Packed = GPSPackedGeometry[Index].z;
+	float3 Unit = float3((float)(Packed & 1023u), (float)((Packed >> 10u) & 1023u),
+		(float)((Packed >> 20u) & 1023u)) / 1023.0f;
+	return exp(GPSScaleLogMin + Unit * GPSScaleLogExtent);
+}
+
+float4 GPSDecodeRotation(uint Index)
+{
+	uint Packed = GPSPackedGeometry[Index].w;
+	uint Largest = Packed >> 30u;
+	float3 Small = (float3((float)(Packed & 1023u), (float)((Packed >> 10u) & 1023u),
+		(float)((Packed >> 20u) & 1023u)) / 1023.0f - 0.5f) * 1.41421356237f;
+	float Missing = sqrt(max(1.0f - dot(Small, Small), 0.0f));
+	float4 Rotation = Largest == 0u ? float4(Missing, Small.x, Small.y, Small.z) :
+		Largest == 1u ? float4(Small.x, Missing, Small.y, Small.z) :
+		Largest == 2u ? float4(Small.x, Small.y, Missing, Small.z) :
+		float4(Small.x, Small.y, Small.z, Missing);
+	return normalize(Rotation);
+}
+
+float4 GPSDecodeColor(uint Index)
+{
+	uint Packed = GPSPackedColors[Index];
+	uint OpacityWord = GPSPackedOpacities[Index >> 2u];
+	uint Alpha = (OpacityWord >> ((Index & 3u) << 3u)) & 255u;
+	return float4(float3((float)(Packed & 1023u), (float)((Packed >> 10u) & 1023u),
+		(float)((Packed >> 20u) & 1023u)) / 1023.0f, (float)Alpha / 255.0f);
+}

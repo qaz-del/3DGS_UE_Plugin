@@ -1,0 +1,374 @@
+#include "/Engine/Public/Platform.ush"
+#include "/Engine/Private/Common.ush"
+#include "/Plugin/GaussianPointSplatting/Private/GPSPackedGaussian.ush"
+#include "/Plugin/GaussianPointSplatting/Private/GPSSceneDepth.ush"
+
+StructuredBuffer<uint> VisibleIndices;
+StructuredBuffer<uint> ReadRawCounts;
+StructuredBuffer<uint> ReadFinalCounts;
+StructuredBuffer<uint> ReadRawTotal;
+StructuredBuffer<uint> ReadWorkTotal;
+StructuredBuffer<uint2> ReadWorkIndices;
+StructuredBuffer<float4> ReadProjected0;
+StructuredBuffer<float4> ReadProjected1;
+
+RWStructuredBuffer<float4> Projected0;
+RWStructuredBuffer<float4> Projected1;
+RWStructuredBuffer<uint> RawCounts;
+RWStructuredBuffer<uint> FinalCounts;
+RWStructuredBuffer<uint> RawTotal;
+RWStructuredBuffer<uint> WorkTotal;
+RWStructuredBuffer<uint2> WorkIndices;
+RWBuffer<uint> IndirectArgs;
+RWTexture2D<UlongType> PackedSamplesUAV;
+Texture2D<UlongType> PackedSamplesSRV;
+StructuredBuffer<uint> SourceIDs;
+RWTexture2DArray<float4> LayerColor;
+RWTexture2DArray<uint2> LayerHit;
+uint LayerIndex;
+float Supersampling;
+float4x4 LocalToView;
+
+uint GaussianCount;
+uint GaussianThreadStride;
+uint PixelThreadStride;
+uint UseVisibleIndices;
+uint FrameSeed;
+uint MaxPointsPerGaussian;
+uint MaxWorkItems;
+float GaussianScaleMultiplier;
+float MinClipW;
+float2 ViewRectMin;
+float2 ViewRectSize;
+float2 OutputSize;
+float4x4 LocalToClip;
+
+uint Hash32(uint Value)
+{
+	Value ^= Value >> 16;
+	Value *= 0x7feb352du;
+	Value ^= Value >> 15;
+	Value *= 0x846ca68bu;
+	Value ^= Value >> 16;
+	return Value;
+}
+
+uint2 MakeSeed(uint GaussianIndex, uint Salt)
+{
+	return uint2(Hash32(GaussianIndex ^ FrameSeed ^ Salt),
+		Hash32(GaussianIndex * 0x9e3779b9u + FrameSeed + Salt));
+}
+
+float2 Random2(inout uint2 Seed)
+{
+	Seed.x = Hash32(Seed.x + 0x9e3779b9u);
+	Seed.y = Hash32(Seed.y + Seed.x + 0x85ebca6bu);
+	return (float2(Seed) + 0.5f) * 2.3283064365386963e-10f;
+}
+
+float2 BoxMuller(float U0, float U1)
+{
+	float R = sqrt(max(-2.0f * log(clamp(U0, 1.0e-7f, 1.0f)), 0.0f));
+	float Angle = 6.28318530718f * U1;
+	return R * float2(cos(Angle), sin(Angle));
+}
+
+float Dilog(float Alpha)
+{
+	if (Alpha < 0.01f)
+	{
+		return Alpha + 0.25f * Alpha * Alpha + Alpha * Alpha * Alpha / 9.0f;
+	}
+	float Result = -6.09201442e-01f;
+	Result = mad(Result, Alpha, 1.79126616e+00f);
+	Result = mad(Result, Alpha, -2.14953223e+00f);
+	Result = mad(Result, Alpha, 1.26304372e+00f);
+	Result = mad(Result, Alpha, -4.59069895e-01f);
+	Result = mad(Result, Alpha, -1.87417414e-01f);
+	Result = mad(Result, Alpha, 1.99603130e+00f);
+	Result = mad(Result, Alpha, 5.99669467e-05f);
+	float S = 1.0f - Alpha;
+	return Result + (S > 0.0f ? S * log(max(S, 1.0e-37f)) : 0.0f);
+}
+
+float InverseDilog(float Value)
+{
+	float T = min(Value / 1.64493406685f, 1.0f);
+	float Result = -1.27463503e+01f;
+	Result = mad(Result, T, 5.88993459e+01f);
+	Result = mad(Result, T, -1.16025780e+02f);
+	Result = mad(Result, T, 1.26945827e+02f);
+	Result = mad(Result, T, -8.43108826e+01f);
+	Result = mad(Result, T, 3.48799862e+01f);
+	Result = mad(Result, T, -8.89606235e+00f);
+	Result = mad(Result, T, 1.38640936e+00f);
+	Result = mad(Result, T, -7.80640876e-01f);
+	Result = mad(Result, T, 1.64841888e+00f);
+	return mad(Result, T, -2.82836687e-05f);
+}
+
+float2 CorrectedBoxMuller(float2 Uniform, float Alpha)
+{
+	float Radial = InverseDilog((1.0f - Uniform.x) * Dilog(Alpha)) / max(Alpha, 1.0e-7f);
+	return BoxMuller(clamp(Radial, 1.0e-7f, 1.0f), Uniform.y);
+}
+
+uint SamplePoisson(inout uint2 Seed, float Lambda)
+{
+	if (Lambda <= 1.0e-4f)
+	{
+		return 0u;
+	}
+	if (Lambda < 16.0f)
+	{
+		float Limit = exp(-Lambda);
+		float Product = 1.0f;
+		uint K = 0u;
+		[loop]
+		while (K < MaxPointsPerGaussian)
+		{
+			K++;
+			Product *= Random2(Seed).x;
+			if (Product <= Limit)
+			{
+				return K - 1u;
+			}
+		}
+		return MaxPointsPerGaussian;
+	}
+	float2 U = Random2(Seed);
+	float W = BoxMuller(U.x, U.y).x;
+	float S = sqrt(Lambda);
+	float Kf = Lambda + S * W + (W * W - 1.0f) / 6.0f;
+	Kf += (-(1.0f / 36.0f) * W - (1.0f / 72.0f) * W * W * W) / S;
+	Kf += (-(8.0f / 405.0f) + (7.0f / 810.0f) * W * W + (1.0f / 270.0f) * W * W * W * W) / Lambda;
+	return (uint)clamp(round(Kf), 0.0f, (float)MaxPointsPerGaussian);
+}
+
+float3 RotateByQuat(float4 Quat, float3 Value)
+{
+	return Value + 2.0f * cross(Quat.xyz, cross(Quat.xyz, Value) + Quat.w * Value);
+}
+
+bool ProjectPosition(float3 Position, out float2 Pixel, out float4 Clip)
+{
+	Clip = mul(float4(Position, 1.0f), LocalToClip);
+	if (Clip.w <= 1.0e-6f || mul(float4(Position, 1.0f), LocalToView).z <= MinClipW)
+	{
+		Pixel = 0.0f;
+		return false;
+	}
+	float2 Ndc = Clip.xy / Clip.w;
+	Pixel = ViewRectMin + float2(Ndc.x * 0.5f + 0.5f, 0.5f - Ndc.y * 0.5f) * ViewRectSize;
+	return true;
+}
+
+float2 ProjectAxisToPixel(float3 Axis, float4 CenterClip)
+{
+	float4 DeltaClip = mul(float4(Axis, 0.0f), LocalToClip);
+	float InvW = rcp(CenterClip.w);
+	float2 NdcDerivative = (DeltaClip.xy - CenterClip.xy * (InvW * DeltaClip.w)) * InvW;
+	return NdcDerivative * float2(0.5f * ViewRectSize.x, -0.5f * ViewRectSize.y);
+}
+
+groupshared uint PreprocessGroupCounts[256];
+
+[numthreads(256, 1, 1)]
+void PaperPreprocessCS(uint3 DispatchThreadId : SV_DispatchThreadID, uint3 GroupThreadId : SV_GroupThreadID)
+{
+	uint Index = DispatchThreadId.x + DispatchThreadId.y * GaussianThreadStride;
+	uint Count = 0u;
+	if (Index < GaussianCount)
+	{
+		uint SourceIndex = Index;
+		if (UseVisibleIndices != 0u)
+		{
+			SourceIndex = VisibleIndices[Index];
+		}
+		float Alpha = GPSDecodeColor(SourceIndex).a;
+		float2 Pixel;
+		float4 CenterClip;
+		float3 Position = GPSDecodePosition(SourceIndex);
+		if (Alpha > 0.0f && ProjectPosition(Position, Pixel, CenterClip) && all(isfinite(Pixel)))
+		{
+			float3 Scale = max(GPSDecodeScale(SourceIndex) * GaussianScaleMultiplier, 1.0e-4f);
+			float4 Rotation = GPSDecodeRotation(SourceIndex);
+			float2 D0 = ProjectAxisToPixel(RotateByQuat(Rotation, float3(Scale.x, 0, 0)), CenterClip);
+			float2 D1 = ProjectAxisToPixel(RotateByQuat(Rotation, float3(0, Scale.y, 0)), CenterClip);
+			float2 D2 = ProjectAxisToPixel(RotateByQuat(Rotation, float3(0, 0, Scale.z)), CenterClip);
+			float XX = D0.x * D0.x + D1.x * D1.x + D2.x * D2.x + 0.3f * Supersampling * Supersampling;
+			float XY = D0.x * D0.y + D1.x * D1.y + D2.x * D2.y;
+			float YY = D0.y * D0.y + D1.y * D1.y + D2.y * D2.y + 0.3f * Supersampling * Supersampling;
+			float Det = XX * YY - XY * XY;
+			if (Det > 1.0e-6f && isfinite(Det) && isfinite(XX) && isfinite(XY) && isfinite(YY))
+			{
+				float MaxEigenvalue = 0.5f * (XX + YY + sqrt(max((XX - YY) * (XX - YY) + 4.0f * XY * XY, 0.0f)));
+				float Radius = 3.0f * sqrt(MaxEigenvalue);
+				float2 RectMax = ViewRectMin + ViewRectSize;
+				if (isfinite(Radius) && Pixel.x + Radius >= ViewRectMin.x && Pixel.y + Radius >= ViewRectMin.y &&
+					Pixel.x - Radius < RectMax.x && Pixel.y - Radius < RectMax.y)
+				{
+				float L00 = sqrt(XX);
+				float L10 = XY / L00;
+				float L11 = sqrt(max(YY - L10 * L10, 1.0e-6f));
+					float Lambda = 6.28318530718f * sqrt(Det) * Dilog(Alpha);
+					Lambda = isfinite(Lambda) ? min(Lambda, 1.0e6f) : 0.0f;
+				uint2 Seed = MakeSeed(SourceIndex, 0x6c8e9cf5u);
+				Count = SamplePoisson(Seed, Lambda);
+				if (Count > 0u)
+				{
+					Projected0[Index] = float4(Pixel, mul(float4(Position, 1.0f), LocalToView).z, Alpha);
+					Projected1[Index] = float4(L00, L10, L11, Radius);
+				}
+			}
+			}
+		}
+		RawCounts[Index] = Count;
+	}
+	PreprocessGroupCounts[GroupThreadId.x] = Count;
+	GroupMemoryBarrierWithGroupSync();
+	[unroll]
+	for (uint Stride = 128u; Stride > 0u; Stride >>= 1u)
+	{
+		if (GroupThreadId.x < Stride)
+		{
+			PreprocessGroupCounts[GroupThreadId.x] += PreprocessGroupCounts[GroupThreadId.x + Stride];
+		}
+		GroupMemoryBarrierWithGroupSync();
+	}
+	if (GroupThreadId.x == 0u)
+	{
+		InterlockedAdd(RawTotal[0], PreprocessGroupCounts[0]);
+	}
+}
+
+[numthreads(256, 1, 1)]
+void PaperScaleCountsCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+	uint Index = DispatchThreadId.x + DispatchThreadId.y * GaussianThreadStride;
+	if (Index >= GaussianCount)
+	{
+		return;
+	}
+	uint RawCount = ReadRawCounts[Index];
+	uint Total = ReadRawTotal[0];
+	float Keep = Total > MaxWorkItems ? (0.9f * float(MaxWorkItems) / float(Total)) : 1.0f;
+	uint2 Seed = MakeSeed(Index, 0xe57a8c13u);
+	FinalCounts[Index] = min((uint)floor(float(RawCount) * Keep + Random2(Seed).x), RawCount);
+}
+
+groupshared uint CompactPrefix[256];
+groupshared uint CompactGroupBase;
+
+[numthreads(256, 1, 1)]
+void PaperCompactCS(uint3 DispatchThreadId : SV_DispatchThreadID, uint3 GroupThreadId : SV_GroupThreadID)
+{
+	uint Index = DispatchThreadId.x + DispatchThreadId.y * GaussianThreadStride;
+	uint Count = Index < GaussianCount ? ReadFinalCounts[Index] : 0u;
+	CompactPrefix[GroupThreadId.x] = Count;
+	GroupMemoryBarrierWithGroupSync();
+	[unroll]
+	for (uint Offset = 1u; Offset < 256u; Offset <<= 1u)
+	{
+		uint Addend = GroupThreadId.x >= Offset ? CompactPrefix[GroupThreadId.x - Offset] : 0u;
+		GroupMemoryBarrierWithGroupSync();
+		CompactPrefix[GroupThreadId.x] += Addend;
+		GroupMemoryBarrierWithGroupSync();
+	}
+	if (GroupThreadId.x == 0u)
+	{
+		InterlockedAdd(WorkTotal[0], CompactPrefix[255], CompactGroupBase);
+	}
+	GroupMemoryBarrierWithGroupSync();
+	uint First = CompactGroupBase + CompactPrefix[GroupThreadId.x] - Count;
+	[loop]
+	for (uint Point = 0u; Point < Count; ++Point)
+	{
+		if (First + Point < MaxWorkItems)
+		{
+			WorkIndices[First + Point] = uint2(Index, Point);
+		}
+	}
+}
+
+[numthreads(1, 1, 1)]
+void PaperBuildArgsCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+	uint Count = min(ReadWorkTotal[0], MaxWorkItems);
+	uint TotalGroups = (Count + 63u) / 64u;
+	uint GroupsX = min(max(TotalGroups, 1u), 65535u);
+	IndirectArgs[0] = GroupsX;
+	IndirectArgs[1] = max((TotalGroups + GroupsX - 1u) / GroupsX, 1u);
+	IndirectArgs[2] = 1u;
+}
+
+[numthreads(64, 1, 1)]
+void PaperClearCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+	uint Index = DispatchThreadId.x + DispatchThreadId.y * PixelThreadStride;
+	uint Width = (uint)OutputSize.x;
+	uint Height = (uint)OutputSize.y;
+	if (Width == 0u || Height == 0u || Index >= Width * Height)
+	{
+		return;
+	}
+	PackedSamplesUAV[uint2(Index % Width, Index / Width)] = PackUlongType(uint2(0u, 0u));
+}
+
+[numthreads(64, 1, 1)]
+void PaperSplatCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+	uint WorkCount = min(ReadWorkTotal[0], MaxWorkItems);
+	uint GroupsX = min(max((WorkCount + 63u) / 64u, 1u), 65535u);
+	uint WorkIndex = DispatchThreadId.x + DispatchThreadId.y * GroupsX * 64u;
+	if (WorkIndex >= WorkCount)
+	{
+		return;
+	}
+	uint2 PackedWork = ReadWorkIndices[WorkIndex];
+	uint GaussianIndex = PackedWork.x;
+	uint PointOrdinal = PackedWork.y;
+	uint SourceIndex = GaussianIndex;
+	if (UseVisibleIndices != 0u)
+	{
+		SourceIndex = VisibleIndices[GaussianIndex];
+	}
+	float4 P0 = ReadProjected0[GaussianIndex];
+	float4 P1 = ReadProjected1[GaussianIndex];
+	uint2 Seed = MakeSeed(SourceIndex, PointOrdinal ^ 0xa4d5e20bu);
+	float2 Normal = CorrectedBoxMuller(Random2(Seed), P0.w);
+	float2 Pixel = P0.xy + float2(P1.x * Normal.x, P1.y * Normal.x + P1.z * Normal.y);
+	if (!all(isfinite(Pixel)) || any(Pixel < ViewRectMin) || any(Pixel >= ViewRectMin + ViewRectSize))
+	{
+		return;
+	}
+	int2 Coord = int2(floor(Pixel));
+	if (P0.w * exp(-0.5f * dot(Normal, Normal)) <= (1.0f / 255.0f))
+	{
+		return;
+	}
+	if (GPSBehindScene(Coord, P0.z, ViewRectMin, ViewRectSize)) return;
+	uint DepthKey = ~asuint(P0.z);
+	ImageInterlockedMaxUInt64(PackedSamplesUAV, uint2(Coord), PackUlongType(uint2(~SourceIndex, DepthKey)));
+}
+
+[numthreads(64, 1, 1)]
+void PaperResolveCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+	uint Index = DispatchThreadId.x + DispatchThreadId.y * PixelThreadStride;
+	uint Width = (uint)OutputSize.x;
+	uint Height = (uint)OutputSize.y;
+	if (Width == 0u || Height == 0u || Index >= Width * Height)
+	{
+		return;
+	}
+	uint2 Coord = uint2(Index % Width, Index / Width);
+	uint2 Packed = UnpackUlongType(PackedSamplesSRV.Load(int3(Coord, 0)));
+	uint3 LayerCoord = uint3(Coord, LayerIndex);
+	LayerColor[LayerCoord] = 0.0f;
+	LayerHit[LayerCoord] = uint2(0u, 0xffffffffu);
+	if (Packed.y == 0u) return;
+	uint SourceIndex = ~Packed.x;
+	LayerColor[LayerCoord] = float4(GPSDecodeColor(SourceIndex).rgb, 1.0f);
+	LayerHit[LayerCoord] = uint2(~Packed.y, SourceIDs[SourceIndex]);
+}
